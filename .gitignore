@@ -12,3 +12,6 @@ wheels/
 # Run artifacts
 jobs/
 probe_results.txt
+
+# Local secrets
+.env

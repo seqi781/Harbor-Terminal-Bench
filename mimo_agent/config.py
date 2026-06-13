@@ -1,0 +1,3 @@
+MODEL = "mimo-v2.5-pro"
+MAX_TURNS = 20
+MAX_OUTPUT_CHARS = 10000
