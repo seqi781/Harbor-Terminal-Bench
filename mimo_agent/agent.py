@@ -45,12 +45,92 @@ TOOLS = [
                 "required": ["command"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": (
+                "覆盖式更新你的工作记忆笔记。记下绝不能忘的关键事实："
+                "环境信息、解题文件的确切路径以及如何运行/导入它"
+                "（例如：run.py 在 /app，测试需 cd /app 或 PYTHONPATH=/app）、"
+                "要求的函数签名、已经验证通过的内容。保持简短、结构化。"
+                "只在每个阶段结束、即将进入下一阶段时调用一次，不要每轮或阶段中途调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "notes": {
+                        "type": "string",
+                        "description": "新的完整记忆内容，会整体替换旧的。",
+                    }
+                },
+                "required": ["notes"],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """\
 You are a terminal agent inside a Docker container. Complete the given task by running shell commands.
-Think step by step before each command. When the task is fully done, stop calling tools and explain what you did.
+
+Work in three phases. Do NOT skip ahead. Begin every response by stating which phase
+you are in using its marker tag below, so it is always clear where you are.
+
+<explore environment>
+PHASE A — RECON (explore first):
+Before writing ANY solution code, investigate the environment with read-only commands.
+You MUST find out:
+  - the current directory and its files
+  - the runtime version (e.g. python3 --version)
+  - whether every module/package you intend to use can actually be imported
+  - which existing files you need to create or edit, and their exact required paths
+  - how the task will be checked: look for test files, the exact function signature,
+    and any expected output paths the task names
+RULE: do not write solution code until recon has confirmed your approach will work
+(dependencies importable, signature and file path correct). Most import / path errors
+come from skipping this step.
+
+<implement>
+PHASE B — IMPLEMENT (smallest steps):
+Make the smallest change that moves forward, then immediately confirm it loads/imports
+before continuing. Do not write the whole solution in one shot.
+
+<verify>
+PHASE C — VERIFY (prove it with assertions + exit codes, never with a printed "ok"):
+Before you declare the task done you MUST:
+  - re-read the task's exact requirements (signature, file path, behavior)
+  - WRITE AND RUN a test that ASSERTS the required behavior. Use `assert` (or raise on
+    mismatch) so that a WRONG result makes the program crash with a NON-ZERO exit code.
+    For a behavioral requirement (e.g. a concurrency limit), assert the behavior really
+    holds — never accept "it imports" as proof it works.
+  - NEVER write code that unconditionally prints "ok"/"PASS"/"success". A printed
+    success word proves NOTHING: it prints the same whether the code is right or wrong.
+Only after your assertion-based test exits 0 may you stop calling tools and report.
+
+How to think and act:
+  - Plan only the next 1-3 actions. Do not design the entire solution in your head up
+    front. After each command's output, re-plan based on what you actually saw.
+  - Stay strictly on the task's real requirements. Do not test or implement behaviors
+    the task did not ask for.
+  - When you have several INDEPENDENT commands (especially during recon), issue them as
+    multiple tool calls in a SINGLE response instead of one at a time.
+  - JUDGE EVERY COMMAND BY ITS EXIT CODE, NOT BY WORDS IT PRINTED. Each tool result
+    starts with `[exit code: N]`. N==0 means success; N!=0 means it FAILED — never call
+    anything done while its check exits non-zero. A script that prints "ok" can print
+    "ok" even when it is broken; an exit code cannot lie. When checking, prefer commands
+    that fail loudly (`assert`, `set -e`, raising) over ones that print a status word.
+
+Working memory (so you never re-derive what you already learned):
+  - A "## 工作记忆" note is pinned at the very BOTTOM of the conversation — the one place
+    that never scrolls away. Re-read it before each action.
+  - Update it EXACTLY ONCE PER PHASE: right when you finish a phase and are about to move
+    on to the next one, call update_memory a single time to overwrite the note. Do NOT
+    update it every turn or in the middle of a phase. Each update carries forward the key
+    facts: exact file paths and HOW to run / import the solution (e.g. solution is
+    /app/run.py, tests need `cd /app` or `PYTHONPATH=/app`), runtime version, the required
+    function signature, and what you have already verified. Keep it short and structured —
+    it replaces the old note entirely, so carry forward what still matters.
 """
 
 
@@ -97,6 +177,10 @@ class MiMoAgent(BaseAgent):
 
         total_input = total_output = 0
         last_response = None
+        # 上一轮是否有命令失败（rc != 0）——用作"遇到难题"信号，决定本轮是否开思考
+        prev_turn_failed = False
+        # 工作记忆：模型通过 update_memory 覆盖更新；每轮注入到对话最底部，永不滚走。
+        memory_text = ""
 
         # 日志文件：每一轮追加一行 JSON，完整记录对话过程
         trace_path = Path(self.logs_dir) / "api_trace.jsonl"
@@ -110,17 +194,32 @@ class MiMoAgent(BaseAgent):
 
         # 3. Agent 循环：最多跑 MAX_TURNS 轮
         for turn in range(MAX_TURNS):
-            self.logger.info(f"[turn {turn + 1}] 发送消息给 LLM ...")
+            # 思考开关：第一轮（拿到问题、做总体规划）开思考；之后默认关掉、快速行动，
+            # 复用历史里那份首轮思考；只有当上一轮有命令失败（遇到难题）时再重新开思考。
+            thinking_on = (turn == 0) or prev_turn_failed
+            self.logger.info(
+                f"[turn {turn + 1}] 发送消息给 LLM ... (thinking={'on' if thinking_on else 'off'})"
+            )
 
             # ── Think：让 LLM 决定下一步做什么 ─────────────────────────────
-            # 记录本轮发送给 LLM 的完整 messages（含所有历史）
-            log("send", {"turn": turn + 1, "messages": _to_serializable(messages)})
+            # 把当前工作记忆注入到对话最底部（永不滚走）。它不进 messages 历史，
+            # 每轮用最新内容重建，保证始终只有一份、且在最后。
+            request_messages = list(messages)
+            if memory_text:
+                request_messages.append({
+                    "role": "system",
+                    "content": f"## 工作记忆（你自己维护，保持最新；行动前先看这里）\n{memory_text}",
+                })
+
+            # 记录本轮真正发送给 LLM 的完整 messages（含历史 + 底部记忆）
+            log("send", {"turn": turn + 1, "thinking": thinking_on, "messages": _to_serializable(request_messages)})
 
             last_response = await client.chat.completions.create(
                 model=MODEL,
-                messages=messages,
+                messages=request_messages,
                 tools=TOOLS,
-                extra_body={"thinking": {"type": "enabled"}},
+                parallel_tool_calls=True,
+                extra_body={"thinking": {"type": "enabled" if thinking_on else "disabled"}},
             )
 
             msg = last_response.choices[0].message
@@ -148,8 +247,23 @@ class MiMoAgent(BaseAgent):
                 break
 
             # ── Observe：执行工具调用，把结果喂回给 LLM ──────────────────
+            # 本轮可能有多个 tool_call（并行工具调用）；顺序执行，记录是否有失败。
+            turn_failed = False
             for tool_call in msg.tool_calls:
                 args = json.loads(tool_call.function.arguments)
+
+                # update_memory：不进容器，只覆盖工作记忆，回一句确认即可。
+                if tool_call.function.name == "update_memory":
+                    memory_text = args.get("notes", "")
+                    self.logger.info(f"[turn {turn + 1}] 更新工作记忆 ({len(memory_text)} 字)")
+                    log("memory", {"turn": turn + 1, "notes": memory_text})
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "(工作记忆已保存)",
+                    })
+                    continue
+
                 command = args["command"]
                 self.logger.info(f"[turn {turn + 1}] 执行命令: {command}")
 
@@ -162,8 +276,14 @@ class MiMoAgent(BaseAgent):
                 combined = stdout + stderr or "(no output)"
                 if len(combined) > MAX_OUTPUT_CHARS:
                     combined = "...(truncated)\n" + combined[-MAX_OUTPUT_CHARS:]
+                # 把退出码放在最前面交给 LLM：这是唯一可信的成功/失败信号，
+                # 不能靠脚本里 print 出来的 "ok"（对错都会照样打印）来判断。
+                combined = f"[exit code: {result.return_code}]\n{combined}"
 
                 self.logger.info(f"[turn {turn + 1}] exit={result.return_code}  output={combined[:200]}")
+
+                if result.return_code != 0:
+                    turn_failed = True
 
                 # 记录工具执行的完整结果：命令、退出码、stdout、stderr
                 log("tool", {
@@ -180,6 +300,9 @@ class MiMoAgent(BaseAgent):
                     "tool_call_id": tool_call.id,
                     "content": combined,
                 })
+
+            # 本轮有命令失败 → 下一轮重新开思考，集中处理这个难题
+            prev_turn_failed = turn_failed
 
         # 记录任务结束和 token 汇总
         log("done", {
