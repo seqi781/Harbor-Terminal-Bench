@@ -1,15 +1,17 @@
 """
-把 api_trace.jsonl 转换成可读的 HTML 网页。
+把 api_trace.jsonl 转换成网页，通过 HTTP 服务器在浏览器里查看。
 
 用法：
     python trace_viewer.py <api_trace.jsonl 路径>
-    python trace_viewer.py jobs/2026-06-13__09-43-16/cancel-async-tasks__KkNs4DN/agent/api_trace.jsonl
+    python trace_viewer.py jobs/.../agent/api_trace.jsonl
 
-会在同目录下生成 api_trace.html，用浏览器打开即可。
+启动后访问 http://localhost:9080 查看。
+Ctrl+C 停止。
 """
 
 import json
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from html import escape
 
@@ -311,6 +313,19 @@ def build_html(events, source_path):
 </html>"""
 
 
+PORT = 9080
+
+
+def load_events(src: Path) -> list:
+    events = []
+    with src.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+    return events
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python trace_viewer.py <api_trace.jsonl>")
@@ -321,18 +336,34 @@ def main():
         print(f"文件不存在: {src}")
         sys.exit(1)
 
-    events = []
-    with src.open() as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            # 每次请求都重新读取文件，方便边跑边刷新
+            events = load_events(src)
+            html = build_html(events, str(src)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
 
-    html = build_html(events, str(src))
+        def log_message(self, *_a, **_k):
+            pass
 
-    out = src.with_suffix(".html")
-    out.write_text(html, encoding="utf-8")
-    print(f"✓ 生成完毕: {out}")
+    HTTPServer.allow_reuse_address = True
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as exc:
+        print(f"无法绑定端口 {PORT}：{exc}")
+        print(f"  可能已有旧进程占用，先停掉它：  fuser -k {PORT}/tcp")
+        sys.exit(1)
+    print(f"✓ 服务已启动：http://localhost:{PORT}")
+    print(f"  文件：{src}")
+    print("  Ctrl+C 停止")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
 
 
 if __name__ == "__main__":
