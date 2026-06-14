@@ -2,10 +2,16 @@
 把 api_trace.jsonl 转换成网页，通过 HTTP 服务器在浏览器里查看。
 
 用法：
-    python trace_viewer.py <api_trace.jsonl 路径>
+    # 不带参数：扫描整个 jobs/ 下所有 job 的所有任务（默认，列表自动刷新）
+    python trace_viewer.py
+    # 指定某个 job 目录：只看该 job 下的任务
+    python trace_viewer.py jobs/2026-06-13__12-40-55
+    # 单个 trace
     python trace_viewer.py jobs/.../agent/api_trace.jsonl
 
 启动后访问 http://localhost:9080 查看。
+注意：若在 SSH 远程/VSCode-Remote 上运行，需在本地把 9080 端口转发过来
+（VSCode 的 PORTS 面板 → Forward a Port → 9080）。
 Ctrl+C 停止。
 """
 
@@ -14,6 +20,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from html import escape
+from urllib.parse import urlparse, parse_qs
 
 
 CSS = """
@@ -248,7 +255,7 @@ def render_done(ev):
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
 
-def build_html(events, source_path):
+def build_html(events, source_path, back_to_index=False):
     from collections import defaultdict
 
     init_ev  = next((e for e in events if e["event"] == "init"), {})
@@ -302,8 +309,9 @@ def build_html(events, source_path):
 </head>
 <body>
 <div class="page">
+  {'<a href="/" style="color:#7dd3fc;font-size:0.8rem;text-decoration:none">← 返回任务列表</a>' if back_to_index else ''}
   <h1>Agent Trace Viewer</h1>
-  <div class="subtitle">api_trace.jsonl 可视化</div>
+  <div class="subtitle">{escape(str(source_path))}</div>
   {init_html}
   {"".join(turn_blocks)}
   {done_html}
@@ -326,26 +334,260 @@ def load_events(src: Path) -> list:
     return events
 
 
+# ── job 目录模式 ─────────────────────────────────────────────────────────────
+
+def find_traces(root: Path) -> list:
+    """
+    找到 root 下所有任务的 api_trace.jsonl。
+    - root = jobs/ 根目录：匹配 <job>/<trial>/agent/api_trace.jsonl（两层）
+    - root = 单个 job 目录：匹配 <trial>/agent/api_trace.jsonl（一层）
+    两种都试，返回去重后的路径列表。
+    """
+    traces = set(root.glob("*/*/agent/api_trace.jsonl"))
+    traces |= set(root.glob("*/agent/api_trace.jsonl"))
+    return sorted(traces)
+
+
+def scan_job_dir(root: Path) -> list:
+    """扫描 root 下每个任务的摘要。每次请求重扫，支持边跑边实时刷新。"""
+    entries = []
+    for trace_path in find_traces(root):
+        trial_dir = trace_path.parent.parent          # <task>__<id>/
+        trial_name = trial_dir.name
+        rel = trial_dir.relative_to(root).as_posix()  # 详情页定位用（跨 job 唯一）
+        job_name = trial_dir.parent.name if trial_dir.parent != root else ""
+        try:
+            mtime = trace_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        reward = in_tok = out_tok = turns = None
+
+        # 优先用 result.json（reward + token 最权威）
+        result_path = trial_dir / "result.json"
+        if result_path.exists():
+            try:
+                r = json.loads(result_path.read_text())
+                reward = (r.get("verifier_result") or {}).get("rewards", {}).get("reward")
+                ar = r.get("agent_result") or {}
+                in_tok = ar.get("n_input_tokens")
+                out_tok = ar.get("n_output_tokens")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # reward 回退：verifier/reward.txt
+        if reward is None:
+            reward_txt = trial_dir / "verifier" / "reward.txt"
+            if reward_txt.exists():
+                try:
+                    reward = float(reward_txt.read_text().strip())
+                except (ValueError, OSError):
+                    pass
+
+        # turns / token 回退：trace 的 done 事件
+        if turns is None or in_tok is None:
+            try:
+                evs = load_events(trace_path)
+                done = next((e for e in evs if e.get("event") == "done"), None)
+                if done:
+                    turns = done.get("total_turns")
+                    in_tok = in_tok if in_tok is not None else done.get("total_input_tokens")
+                    out_tok = out_tok if out_tok is not None else done.get("total_output_tokens")
+                elif turns is None:
+                    turns = sum(1 for e in evs if e.get("event") == "send")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if reward is None:
+            status = "pending"
+        elif reward >= 1.0:
+            status = "pass"
+        else:
+            status = "fail"
+
+        entries.append({
+            "trial_name": trial_name,
+            "rel": rel,
+            "job": job_name,
+            "mtime": mtime,
+            "trace_path": trace_path,
+            "reward": reward,
+            "in_tok": in_tok,
+            "out_tok": out_tok,
+            "turns": turns,
+            "status": status,
+        })
+    return entries
+
+
+def _ago(ts: float, now: float) -> str:
+    """把时间戳渲染成「几秒/分钟/小时前」。"""
+    if not ts:
+        return "—"
+    d = max(0, int(now - ts))
+    if d < 60:
+        return f"{d}s 前"
+    if d < 3600:
+        return f"{d // 60}m 前"
+    if d < 86400:
+        return f"{d // 3600}h 前"
+    return f"{d // 86400}d 前"
+
+
+def build_index_html(job_dir: Path, entries: list, *, refresh_sec: int = 8,
+                     multi_job: bool = True) -> str:
+    import time
+    now = time.time()
+
+    total = len(entries)
+    passed = sum(1 for e in entries if e["status"] == "pass")
+    failed = sum(1 for e in entries if e["status"] == "fail")
+    pending = sum(1 for e in entries if e["status"] == "pending")
+    rate = f"{passed / total * 100:.1f}%" if total else "—"
+
+    def fmt(n):
+        return f"{n:,}" if isinstance(n, int) else "—"
+
+    def task_row(e):
+        st = e["status"]
+        badge_cls = {"pass": "badge-ok", "fail": "badge-err", "pending": "badge-pending"}[st]
+        reward_txt = "—" if e["reward"] is None else f"{e['reward']:g}"
+        return f"""
+<tr class="idx-row idx-{st}" onclick="location.href='/?t={escape(e['rel'])}'">
+  <td><span class="{badge_cls}">{escape(reward_txt)}</span></td>
+  <td class="idx-name">{escape(e['trial_name'])}</td>
+  <td class="idx-num">{fmt(e['turns'])}</td>
+  <td class="idx-num">{fmt(e['in_tok'])}</td>
+  <td class="idx-num">{fmt(e['out_tok'])}</td>
+  <td class="idx-num idx-ago">{escape(_ago(e['mtime'], now))}</td>
+</tr>"""
+
+    table_head = ('<tr><th>reward</th><th>任务</th><th>轮数</th>'
+                  '<th>in tok</th><th>out tok</th><th>更新</th></tr>')
+    order = {"fail": 0, "pending": 1, "pass": 2}
+
+    # 按 job（文件结构）分组。多 job：每个 job 一个折叠分组；单 job：一张表。
+    sections = []
+    if multi_job:
+        jobs = {}
+        for e in entries:
+            jobs.setdefault(e["job"], []).append(e)
+        # job 目录名是时间戳，最新的排上面
+        for job in sorted(jobs, reverse=True):
+            items = jobs[job]
+            j_pass = sum(1 for e in items if e["status"] == "pass")
+            j_fail = sum(1 for e in items if e["status"] == "fail")
+            j_pend = sum(1 for e in items if e["status"] == "pending")
+            j_last = max((e["mtime"] for e in items), default=0)
+            # 组内：失败优先，便于排查
+            rows = "".join(task_row(e) for e in
+                           sorted(items, key=lambda e: (order[e["status"]], e["trial_name"])))
+            sections.append(f"""
+<details class="job-group" open>
+  <summary class="job-head">
+    <span class="job-name">{escape(job)}/</span>
+    <span class="job-stat">{len(items)} 任务</span>
+    <span class="job-stat ok">{j_pass} 通过</span>
+    <span class="job-stat err">{j_fail} 失败</span>
+    {f'<span class="job-stat pend">{j_pend} 未完成</span>' if j_pend else ''}
+    <span class="job-stat ago">更新 {escape(_ago(j_last, now))}</span>
+  </summary>
+  <table class="idx">{table_head}{rows}</table>
+</details>""")
+    else:
+        rows = "".join(task_row(e) for e in
+                       sorted(entries, key=lambda e: (order[e["status"]], e["trial_name"])))
+        sections.append(f'<table class="idx">{table_head}{rows}</table>')
+
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{refresh_sec}">
+<title>Job Trace Index</title>
+<style>{CSS}
+table.idx {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+table.idx th {{ text-align: left; font-size: 0.7rem; color: #64748b; text-transform: uppercase;
+  letter-spacing: .05em; padding: 6px 10px; border-bottom: 1px solid #334155; }}
+.idx-row {{ cursor: pointer; border-bottom: 1px solid #1e293b; }}
+.idx-row:hover {{ background: #1e293b; }}
+.idx-row td {{ padding: 8px 10px; font-size: 0.82rem; }}
+.idx-name {{ font-family: 'JetBrains Mono', monospace; color: #cbd5e1; }}
+.idx-job {{ font-family: 'JetBrains Mono', monospace; color: #64748b; font-size: 0.75rem; }}
+.idx-num {{ text-align: right; color: #94a3b8; font-variant-numeric: tabular-nums; }}
+.idx-ago {{ color: #475569; }}
+.idx-fail .idx-name {{ color: #fca5a5; }}
+.badge-pending {{ background: #475569; color: #fff; padding: 1px 7px; border-radius: 99px; font-size: 0.7rem; }}
+.job-group {{ margin-top: 18px; border: 1px solid #1e293b; border-radius: 8px; overflow: hidden; }}
+.job-head {{ display: flex; align-items: center; gap: 12px; cursor: pointer;
+  padding: 10px 14px; background: #1e293b; user-select: none; font-size: 0.8rem; }}
+.job-head::-webkit-details-marker {{ display: none; }}
+.job-name {{ font-family: 'JetBrains Mono', monospace; color: #7dd3fc; font-weight: 600; }}
+.job-stat {{ color: #94a3b8; font-size: 0.75rem; }}
+.job-stat.ok {{ color: #86efac; }}
+.job-stat.err {{ color: #fca5a5; }}
+.job-stat.pend {{ color: #cbd5e1; }}
+.job-stat.ago {{ margin-left: auto; color: #475569; }}
+.job-group table.idx {{ margin-top: 0; }}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Job Trace Index</h1>
+  <div class="subtitle">{escape(str(job_dir))} · 每 {refresh_sec}s 自动刷新 · {time.strftime('%H:%M:%S', time.localtime(now))} 扫描</div>
+  <div class="done-card">
+    <div class="stat"><strong>{total}</strong> 任务</div>
+    <div class="stat"><strong>{passed}</strong> 通过</div>
+    <div class="stat"><strong>{failed}</strong> 失败</div>
+    <div class="stat"><strong>{pending}</strong> 未完成</div>
+    <div class="stat"><strong>{rate}</strong> 通过率</div>
+  </div>
+  {"".join(sections)}
+</div>
+</body>
+</html>"""
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python trace_viewer.py <api_trace.jsonl>")
+    # 不带参数 → 默认扫描整个 jobs/ 根目录
+    src = Path(sys.argv[1]) if len(sys.argv) >= 2 else Path("jobs")
+    if not src.exists():
+        print(f"路径不存在: {src}")
         sys.exit(1)
 
-    src = Path(sys.argv[1])
-    if not src.exists():
-        print(f"文件不存在: {src}")
-        sys.exit(1)
+    is_dir = src.is_dir()
+    # 多 job 模式：root 下存在两层结构（<job>/<trial>/agent/...）
+    multi_job = is_dir and bool(list(src.glob("*/*/agent/api_trace.jsonl")))
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            # 每次请求都重新读取文件，方便边跑边刷新
-            events = load_events(src)
-            html = build_html(events, str(src)).encode("utf-8")
-            self.send_response(200)
+        def _send(self, html: str, code: int = 200):
+            data = html.encode("utf-8")
+            self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(html)
+            self.wfile.write(data)
+
+        def do_GET(self):
+            # 每次请求都重新读取，方便边跑边刷新
+            if not is_dir:
+                self._send(build_html(load_events(src), str(src)))
+                return
+
+            # 目录模式：/ → 索引页；/?t=<rel> → 详情页（rel 可能含 job 层）
+            query = parse_qs(urlparse(self.path).query)
+            trial = (query.get("t") or [None])[0]
+            if not trial:
+                self._send(build_index_html(src, scan_job_dir(src), multi_job=multi_job))
+                return
+
+            trace_path = src / trial / "agent" / "api_trace.jsonl"
+            if not trace_path.exists():
+                self._send(
+                    f"<p style='font-family:sans-serif'>找不到 trace: {escape(trial)}"
+                    f"<br><a href='/'>← 返回列表</a></p>", code=404)
+                return
+            self._send(build_html(load_events(trace_path), trace_path, back_to_index=True))
 
         def log_message(self, *_a, **_k):
             pass
@@ -358,7 +600,7 @@ def main():
         print(f"  可能已有旧进程占用，先停掉它：  fuser -k {PORT}/tcp")
         sys.exit(1)
     print(f"✓ 服务已启动：http://localhost:{PORT}")
-    print(f"  文件：{src}")
+    print(f"  {'目录' if is_dir else '文件'}：{src}")
     print("  Ctrl+C 停止")
     try:
         server.serve_forever()

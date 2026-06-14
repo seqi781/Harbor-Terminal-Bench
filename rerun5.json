@@ -1,0 +1,20 @@
+{
+  "agents": [
+    {
+      "import_path": "main:MiMoAgent"
+    }
+  ],
+  "tasks": [
+    { "name": "terminal-bench/filter-js-from-html", "ref": "latest" },
+    { "name": "terminal-bench/openssl-selfsigned-cert", "ref": "latest" },
+    { "name": "terminal-bench/count-dataset-tokens", "ref": "latest" },
+    { "name": "terminal-bench/sanitize-git-repo", "ref": "latest" },
+    { "name": "terminal-bench/git-multibranch", "ref": "latest" }
+  ],
+  "n_concurrent_trials": 5,
+  "environment": {
+    "type": "docker",
+    "delete": true
+  },
+  "verifier": {}
+}
